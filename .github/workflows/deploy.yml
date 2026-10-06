@@ -1,0 +1,71 @@
+name: Deploy (reutilizavel)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      app_port:
+        required: true
+        type: string
+      image:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # Secrets do Environment: SSH_HOST, SSH_USER, SSH_KEY, DB_PASSWORD
+    environment: ${{ inputs.environment }}
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      APP_PORT: ${{ inputs.app_port }}
+      APP_IMAGE: ${{ inputs.image }}
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_KEY: ${{ secrets.SSH_KEY }}
+      DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GHCR_USER: ${{ github.actor }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+
+      - name: Enviar docker-compose.yml
+        run: |
+          ssh -i ~/.ssh/id_deploy "$SSH_USER@$SSH_HOST" "mkdir -p ~/esg-$ENVIRONMENT"
+          scp -i ~/.ssh/id_deploy docker-compose.yml "$SSH_USER@$SSH_HOST:~/esg-$ENVIRONMENT/docker-compose.yml"
+
+      - name: Subir aplicacao no servidor
+        run: |
+          ssh -i ~/.ssh/id_deploy "$SSH_USER@$SSH_HOST" bash -s <<EOF
+          set -e
+          cd ~/esg-$ENVIRONMENT
+          cat > .env <<ENVFILE
+          POSTGRES_DB=esg
+          POSTGRES_USER=esg
+          POSTGRES_PASSWORD=$DB_PASSWORD
+          APP_ENV=$ENVIRONMENT
+          APP_PORT=$APP_PORT
+          APP_IMAGE=$APP_IMAGE
+          ENVFILE
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+          docker compose -p esg-$ENVIRONMENT pull app
+          docker compose -p esg-$ENVIRONMENT up -d --no-build
+          EOF
+
+      - name: Smoke test (health check)
+        run: |
+          ssh -i ~/.ssh/id_deploy "$SSH_USER@$SSH_HOST" \
+            "curl -fsS --retry 20 --retry-delay 5 --retry-connrefused http://localhost:$APP_PORT/actuator/health"
